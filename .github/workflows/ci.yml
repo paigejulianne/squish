@@ -44,3 +44,20 @@ jobs:
 
       - name: Check artifacts exist
         run: test -f squish.dll && test -f squish.exe && test -f libsquish.dll.a
+
+  windows-msvc:
+    name: native Windows MSVC build (build-windows.bat)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build squish.dll + squish.exe
+        shell: cmd
+        run: build-windows.bat
+
+      - name: Round-trip smoke test
+        shell: cmd
+        run: |
+          squish.exe c README.md readme.sq
+          squish.exe d readme.sq readme.out
+          fc /b README.md readme.out
