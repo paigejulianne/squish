@@ -18,6 +18,9 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 - `SECURITY.md`
 - `.github/PULL_REQUEST_TEMPLATE.md`
 - `.github/ISSUE_TEMPLATE/` (bug report, feature request)
+- `CHANGELOG.md`
+- `make dll` now also cross-compiles `squish.exe` (statically linked
+  against a mingw-built `libsquish-win.a`), not just `squish.dll`
 
 ## [1.0.0]
 
