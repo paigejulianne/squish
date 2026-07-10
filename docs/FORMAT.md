@@ -243,3 +243,55 @@ offset            size      field
 - The trailer is independent of the stream format: changing it does not affect
   stream compatibility, and it carries its own version byte (the `1` in the
   magic) for future revisions.
+
+## 12. Directory archive "SQAR" (CLI packaging)
+
+Like §11, this section is **not** part of the compressed format. It describes
+how the CLI packs a directory tree into a single byte stream so the ordinary
+compressor can handle directories without knowing anything about files. The
+CLI serializes the tree into an `SQAR` buffer, compresses that buffer as an
+§1 stream, and on decompression checks whether the decompressed bytes begin
+with the `SQAR` magic: if so it unpacks a tree, otherwise the bytes are a
+single file, written verbatim. Single-file compression never uses this
+wrapper, so it stays byte-for-byte compatible with readers that predate it.
+
+The buffer is a fixed header followed by a flat, pre-order list of entries;
+all integers are little-endian:
+
+```
+offset  size       field
+0       8          magic: 'S' 'Q' 'A' 'R' '0' '1' 0x0A 0x1A
+8       4          version u32 (currently 1)
+12      4          flags u32 (0)
+16      8          entry count u64
+24      ...        entries
+```
+
+Each entry:
+
+```
+offset  size       field
+0       1          type: 0 = regular file, 1 = directory
+1       4          mode u32: unix permission bits (low 9); informational,
+                   synthesized as 0644/0755 by producers without them
+5       4          path length P u32 (1 .. 65535)
+9       8          data length D u64 (0 for a directory)
+17      P          path: relative, '/'-separated, UTF-8, no terminator
+17 + P  D          file contents (regular files only; absent for a directory)
+```
+
+- Paths are relative to the archived directory and use `/` separators.
+  Directories are emitted before their contents so empty directories are
+  preserved. Sibling entries are stored sorted by name, so the archive
+  depends only on the tree, not on directory iteration order.
+- A reader must reject any entry whose path is absolute, contains an empty,
+  `.`, or `..` component, or contains `\` or `:` — this is what stops an
+  archive from writing outside the extraction root. It must also verify that
+  every length field stays within the buffer and that the entries tile it
+  exactly; a violation is a format error.
+- There is no archive-level checksum: the enclosing §1 stream already
+  carries and verifies one over these exact bytes.
+- Because the archive is just the payload of an ordinary stream, `squish s`
+  (§11) packs a directory with no change to the SFX wrapper — the stub
+  decompresses the payload and, finding the `SQAR` magic, unpacks a tree
+  instead of writing one file.

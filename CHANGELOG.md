@@ -11,6 +11,17 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ### Added
 
+- CLI: directory support for `c`, `d`, and `s`. When `input` is a directory,
+  `squish c` serializes the whole tree (files, subdirectories, empty
+  directories, and unix permission bits) into a single `SQAR` archive stream
+  and compresses that; `squish d` detects the archive on decompression and
+  recreates the tree under `output`. `squish s` packs a directory the same
+  way into a self-extracting executable. Single-file compression is
+  unchanged and byte-for-byte compatible with earlier releases (the archive
+  wrapper is used only for directories). Extraction rejects absolute paths
+  and `..` traversal, so an archive can never write outside its target
+  directory; entries are stored in sorted order, so an archive depends only
+  on the tree, not on filesystem iteration order. See docs/FORMAT.md §12.
 - CLI: `s` command — build a self-extracting archive. `squish s input output`
   compresses `input` and appends it (plus the original name and a 32-byte
   trailer) to a copy of the `squish` CLI used as a stub; the resulting
