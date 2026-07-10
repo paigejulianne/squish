@@ -36,6 +36,19 @@ jobs:
           ( mkdir sfxout && cd sfxout && ../readme.run -q )
           cmp README.md sfxout/README.md
 
+      - name: Directory archive round-trip
+        run: |
+          mkdir -p tree/sub tree/empty
+          cp README.md tree/a.txt
+          printf 'nested\n' > tree/sub/b.txt
+          ./squish c tree tree.sq
+          ./squish d tree.sq tree-out
+          diff -r tree tree-out
+          test -d tree-out/empty
+          ./squish s tree tree.run
+          ( mkdir sfxdir && cd sfxdir && ../tree.run -q )
+          diff -r tree sfxdir/tree
+
   windows-cross:
     name: cross-compile Windows DLL + CLI
     runs-on: ubuntu-latest
@@ -77,3 +90,14 @@ jobs:
           ..\readme_sfx.exe -q
           cd ..
           fc /b README.md sfxout\README.md
+
+      - name: Directory archive round-trip
+        shell: cmd
+        run: |
+          mkdir tree\sub
+          copy README.md tree\a.txt
+          echo nested> tree\sub\b.txt
+          squish.exe c tree tree.sq
+          squish.exe d tree.sq tree-out
+          fc /b tree\a.txt tree-out\a.txt
+          fc /b tree\sub\b.txt tree-out\sub\b.txt

@@ -83,9 +83,14 @@ ratio for near-linear speedup.
 
 ```
 make                            # libsquish.so + squish CLI
-./squish c input output.sq      # compress
+./squish c input output.sq      # compress a file (or a directory tree)
 ./squish d output.sq restored   # decompress (checksum-verified)
 ```
+
+`input` may be a directory: it is serialized into a single `SQAR` archive
+stream and compressed as one unit, and `d` recreates the tree under
+`restored`. Single files are compressed exactly as before. See
+[docs/FORMAT.md](docs/FORMAT.md) §12.
 
 SQUISH is also a library — `squish.h` + `libsquish.so` (or `make dll` for
 Windows); see [docs/API.md](docs/API.md) and `examples/`.

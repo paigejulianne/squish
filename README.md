@@ -48,12 +48,24 @@ No dependencies beyond libc/libm.
 ```sh
 ./squish c bigfile bigfile.sq          # compress
 ./squish d bigfile.sq restored         # decompress (checksum-verified)
+./squish c project project.sq          # compress a whole directory tree
+./squish d project.sq restored-dir     # ... recreate it under restored-dir
 ./squish -t 0 c bigfile bigfile.sq     # compress on all cores (multi-block)
 ./squish -t 0 -b 4 c big big.sq        # ... with 4 MiB blocks (more parallel,
                                        #     slightly worse ratio)
 ./squish s report.pdf report.run       # make a self-extracting archive
 ./report.run                           # ... run it to restore report.pdf
 ```
+
+`input` may be a file or a **directory**. A directory is packed into a single
+archive stream (files, subdirectories, empty directories, and permission bits
+preserved) and compressed as one unit, so cross-file redundancy is modeled
+too; `d` detects the archive and recreates the tree under `output`.
+Extraction refuses absolute paths and `..`, so an archive never writes
+outside its target directory, and entries are stored sorted, so the output
+depends only on the tree. Single files are compressed exactly as before —
+the archive wrapper is used only for directories. See
+[docs/FORMAT.md §12](docs/FORMAT.md) for the layout.
 
 `-t N` compresses with N threads (`0` = all cores) by splitting the input
 into independently modeled blocks — near-linear speedup, at a small ratio
@@ -65,10 +77,11 @@ it) and reads both formats transparently. Budget ~150 MB of model memory
 per thread.
 
 The `s` command writes a **self-extracting archive**: `squish s input output`
-compresses `input` and produces an executable `output` that carries the
-compressed data. Running it — with no `squish` and no `libsquish` installed —
-decompresses (and checksum-verifies) the original back to its stored name in
-the current directory, or to a path you name:
+compresses `input` (a file or a directory tree) and produces an executable
+`output` that carries the compressed data. Running it — with no `squish` and
+no `libsquish` installed — decompresses (and checksum-verifies) the original
+back to its stored name in the current directory, or to a path you name;
+a directory archive unpacks the whole tree:
 
 ```sh
 ./squish s report.pdf report.run   # build (Linux: chmod +x is applied for you)
