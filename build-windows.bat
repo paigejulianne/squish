@@ -66,9 +66,14 @@ rem The signer is the `sign` .NET global tool (https://github.com/dotnet/sign),
 rem installed automatically below if missing (needs the .NET SDK on PATH).
 
 rem Load signer.json (if present); values already in the environment win.
+rem Parsed with findstr below -- signer.json is a flat "key": "value" object,
+rem so no PowerShell/JSON tooling is needed.
 set "SIGNER_JSON=%~dp0signer.json"
 if exist "%SIGNER_JSON%" (
-    for /f "usebackq tokens=1* delims==" %%a in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$j='%SIGNER_JSON%'; $c = ConvertFrom-Json (Get-Content -Raw -LiteralPath $j); $m = [ordered]@{ TRUSTED_SIGNING_ENDPOINT = $c.endpoint; TRUSTED_SIGNING_ACCOUNT = $c.account; TRUSTED_SIGNING_PROFILE = $c.certificateProfile; TRUSTED_SIGNING_TIMESTAMP = $c.timestampUrl }; foreach ($k in $m.Keys) { $ev = [Environment]::GetEnvironmentVariable($k); $val = $(if ($ev) { $ev } else { $m[$k] }); if ($val) { $k + '=' + $val } }"`) do set "%%a=%%b"
+    call :readjson endpoint            TRUSTED_SIGNING_ENDPOINT
+    call :readjson account             TRUSTED_SIGNING_ACCOUNT
+    call :readjson certificateProfile  TRUSTED_SIGNING_PROFILE
+    call :readjson timestampUrl        TRUSTED_SIGNING_TIMESTAMP
 )
 
 rem Endpoint, account and profile are all required to sign.
@@ -112,4 +117,14 @@ goto :eof
 :nosign
 echo.
 echo Note: Azure Trusted Signing not configured ^(no signer.json and TRUSTED_SIGNING_* unset^); binaries are unsigned.
+goto :eof
+
+rem Read one "key": "value" pair from signer.json into an environment variable.
+rem   %1 = JSON key name        %2 = destination variable
+rem A value already present in the environment is left untouched (env overrides
+rem the file). Splitting each line on the quote character makes the 4th field
+rem the value, so URLs (with their ':' and '/') come through intact.
+:readjson
+if defined %2 goto :eof
+for /f usebackq^ tokens^=4^ delims^=^" %%a in (`findstr /c:"\"%~1\":" "%SIGNER_JSON%"`) do set "%2=%%a"
 goto :eof
