@@ -198,6 +198,44 @@ single file member to `dst_path` (its parent directories must already exist).
 against traversal on the way out, so an archive can never write outside
 `dst_root`.
 
+### Editing an archive in place
+
+```c
+#define SQUISH_ADD_KEEP_EXISTING 1u   /* skip files already present */
+
+int squish_archive_add(const char *archive_path, const char *src_path,
+                       const char *arc_path, int nthreads, unsigned flags,
+                       squish_progress_fn cb, void *user);
+int squish_archive_remove(const char *archive_path,
+                          const char *const *paths, size_t npaths,
+                          squish_progress_fn cb, void *user);
+```
+Add or remove members **without re-packing the whole archive**. Members that
+survive the edit are copied byte-for-byte — their already-compressed blocks are
+moved verbatim — so only files being *added* are ever compressed. The cost is
+one pass of I/O over the archive plus compressing just the added bytes, not a
+full re-pack (which, at SQUISH's ~0.5 MB/s, is the difference between seconds
+and hours on a large archive). Each call rebuilds into a sibling temp file and
+atomically replaces the original, so an interrupted or failing edit leaves the
+existing archive untouched. The result is **byte-identical** to what
+`squish_archive_create` would produce from the same resulting tree.
+
+`_add` merges the file or directory tree at `src_path` into the archive under
+the archive-relative `arc_path` (`"docs/readme.txt"`), creating any missing
+parent directories. A directory merges into an existing one of the same name:
+its files are added, existing files it does not mention stay in place, and a
+file that collides with an existing file is overwritten — or, with
+`SQUISH_ADD_KEEP_EXISTING` in `flags`, kept (a file/directory type clash at the
+same path is `SQUISH_E_PARAM`). Added files are compressed at the archive's
+existing block size — which is fixed for the whole archive — using `nthreads`.
+`_remove` drops every member whose path is one of `paths[0..npaths)` or lies
+beneath it, and returns `SQUISH_E_FORMAT` (leaving the archive unchanged) if
+nothing matches; removing every member yields a valid empty archive.
+
+Both require a packed (tree) archive: an archive with the `SINGLE` flag — a lone
+file or blob from `squish_compress_file`/`squish_compress_alloc` — returns
+`SQUISH_E_PARAM`.
+
 ```c
 /* list every member, then pull one file out — reading only its blocks */
 squish_archive *a;

@@ -1665,6 +1665,425 @@ done:
     return rc;
 }
 
+/* ============================================================================
+ * Editing an existing archive: squish_archive_add / squish_archive_remove
+ *
+ * Both reduce to "rewrite the archive with a modified member set." Members that
+ * survive the edit are copied block-for-block from the source archive and are
+ * never recompressed; only files being added are compressed. The rebuilt
+ * archive is written to a sibling temp file and atomically swapped in, so any
+ * failure leaves the original intact. Members are re-emitted in the format's
+ * canonical pre-order, so an edited archive is byte-identical to one packed
+ * from the same resulting tree.
+ * ==========================================================================*/
+
+static char *dupstr(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *r = (char*)malloc(n);
+    if (r) memcpy(r, s, n);
+    return r;
+}
+
+/* One member of the rebuilt archive, plus where its bytes come from. */
+typedef struct {
+    u8    type;        /* 0 = file, 1 = directory                           */
+    u32   mode;
+    u64   orig;        /* uncompressed size (0 for a dir or empty file)     */
+    char *path;        /* owned, archive-relative                           */
+    char *fs;          /* owned; !NULL => compress this file (a new add)    */
+    u64   off;         /* file source data_off, then reused as the output   */
+                       /* data_off once the member has been written         */
+    u64  *csz;         /* owned; per-block compressed sizes (dup'd for a    */
+    u32   nblk;        /* survivor; filled while writing a new file)        */
+} redit;
+typedef struct { redit *e; size_t n, cap; } redit_list;
+
+static void redit_list_free(redit_list *L) {
+    for (size_t i = 0; i < L->n; i++) {
+        free(L->e[i].path); free(L->e[i].fs); free(L->e[i].csz);
+    }
+    free(L->e); L->e = NULL; L->n = L->cap = 0;
+}
+
+/* Append a member; takes ownership of path, fs (may be NULL) and csz (may be
+ * NULL), freeing all three on OOM so callers never leak on failure. */
+static int redit_push(redit_list *L, u8 type, u32 mode, u64 orig,
+                      char *path, char *fs, u64 off, u64 *csz, u32 nblk) {
+    if (L->n == L->cap) {
+        size_t nc = L->cap ? L->cap * 2 : 32;
+        redit *ne = (redit*)realloc(L->e, nc * sizeof *ne);
+        if (!ne) { free(path); free(fs); free(csz); return SQUISH_E_NOMEM; }
+        L->e = ne; L->cap = nc;
+    }
+    redit *e = &L->e[L->n++];
+    e->type = type; e->mode = mode; e->orig = orig; e->path = path;
+    e->fs = fs; e->off = off; e->csz = csz; e->nblk = nblk;
+    return SQUISH_OK;
+}
+
+static int redit_find(const redit_list *L, const char *path) {
+    for (size_t i = 0; i < L->n; i++)
+        if (strcmp(L->e[i].path, path) == 0) return (int)i;
+    return -1;
+}
+
+/* Dup a survivor (a reader entry) into L, copying its block layout so L owns
+ * everything independently of the source handle. */
+static int redit_push_survivor(redit_list *L, const arc_ent *e) {
+    char *path = dupstr(e->path);
+    if (!path) return SQUISH_E_NOMEM;
+    u64 *csz = NULL;
+    if (e->nblk) {
+        csz = (u64*)malloc((size_t)e->nblk * sizeof(u64));
+        if (!csz) { free(path); return SQUISH_E_NOMEM; }
+        memcpy(csz, e->csz, (size_t)e->nblk * sizeof(u64));
+    }
+    return redit_push(L, e->type, e->mode, e->orig, path, NULL,
+                      e->data_off, csz, e->nblk);
+}
+
+/* Canonical archive order: compare component by component (each by memcmp),
+ * an ancestor sorting before its descendants. Reproduces the pre-order,
+ * siblings-by-name layout squish_archive_create emits — note this is NOT plain
+ * strcmp, which would misorder a sibling whose name byte is below '/'. */
+static int arc_path_cmp(const char *a, const char *b) {
+    while (*a && *b) {
+        const char *ea = a, *eb = b;
+        while (*ea && *ea != '/') ea++;
+        while (*eb && *eb != '/') eb++;
+        size_t la = (size_t)(ea - a), lb = (size_t)(eb - b);
+        size_t m = la < lb ? la : lb;
+        int c = memcmp(a, b, m);
+        if (c) return c;
+        if (la != lb) return la < lb ? -1 : 1;   /* shorter component first */
+        a = *ea ? ea + 1 : ea;                    /* step past the '/'       */
+        b = *eb ? eb + 1 : eb;
+    }
+    if (*a) return 1;                             /* a is a descendant       */
+    if (*b) return -1;
+    return 0;
+}
+static int redit_cmp(const void *x, const void *y) {
+    return arc_path_cmp(((const redit*)x)->path, ((const redit*)y)->path);
+}
+
+/* Merge one incoming member into L at arcpath (a directory has fs == NULL; a
+ * file passes its owned filesystem path in fs). Frees fs whenever it is not
+ * stored, so the caller never has to. Semantics:
+ *   - path absent            -> add the member
+ *   - dir onto existing dir  -> nothing to do (the trees merge)
+ *   - file onto existing file-> overwrite, or keep the existing one when
+ *                               keep_existing is set
+ *   - any file/dir type clash-> SQUISH_E_PARAM                              */
+static int redit_merge_one(redit_list *L, u8 type, u32 mode, u64 orig,
+                           const char *arcpath, char *fs, int keep_existing) {
+    int idx = redit_find(L, arcpath);
+    if (idx < 0) {
+        char *p = dupstr(arcpath);
+        if (!p) { free(fs); return SQUISH_E_NOMEM; }
+        return redit_push(L, type, mode, orig, p, fs, 0, NULL, 0);
+    }
+    redit *e = &L->e[idx];
+    if (type == 1) {                      /* incoming directory */
+        free(fs);                         /* dirs carry no data source */
+        return e->type == 1 ? SQUISH_OK : SQUISH_E_PARAM;   /* file in the way */
+    }
+    if (e->type != 0) { free(fs); return SQUISH_E_PARAM; }  /* dir where a file goes */
+    if (keep_existing) { free(fs); return SQUISH_OK; }      /* keep the existing file */
+    free(e->fs); free(e->csz);            /* overwrite: become the new file */
+    e->fs = fs; e->csz = NULL; e->nblk = 0;
+    e->type = 0; e->mode = mode; e->orig = orig; e->off = 0;
+    return SQUISH_OK;
+}
+
+/* Ensure every proper ancestor directory of arc_path exists in L (merging with
+ * any already there). Fails if an ancestor is present as a file. */
+static int redit_ensure_ancestors(redit_list *L, const char *arc_path) {
+    size_t n = strlen(arc_path);
+    char *buf = (char*)malloc(n + 1);
+    if (!buf) return SQUISH_E_NOMEM;
+    int rc = SQUISH_OK;
+    for (size_t i = 0; i < n; i++) {
+        if (arc_path[i] != '/') continue;
+        memcpy(buf, arc_path, i); buf[i] = '\0';
+        rc = redit_merge_one(L, 1, 0755, 0, buf, NULL, 0);
+        if (rc != SQUISH_OK) break;
+    }
+    free(buf);
+    return rc;
+}
+
+/* Recursively merge a directory's contents into L under arc_pre. Mirrors
+ * arc_scan, recording each file's filesystem path for later compression. */
+static int redit_scan_add(redit_list *L, const char *fs_dir, const char *arc_pre,
+                          int keep_existing) {
+    char **names; size_t n;
+    if (list_dir(fs_dir, &names, &n) != 0) return SQUISH_E_IO;
+    int rc = SQUISH_OK;
+    for (size_t i = 0; i < n && rc == SQUISH_OK; i++) {
+        char *fs  = path_join(fs_dir, names[i]);
+        char *arc = path_join(arc_pre, names[i]);
+        if (!fs || !arc) { free(fs); free(arc); rc = SQUISH_E_NOMEM; break; }
+        if (strlen(arc) > ARC_MAX_PATH) { free(fs); free(arc); rc = SQUISH_E_FORMAT; break; }
+        if (path_is_dir(fs)) {
+            rc = redit_merge_one(L, 1, path_mode(fs, 0755), 0, arc, NULL, keep_existing);
+            if (rc == SQUISH_OK) rc = redit_scan_add(L, fs, arc, keep_existing);
+            free(fs); free(arc);
+        } else if (path_is_regular(fs)) {
+            /* merge_one takes ownership of fs (and dup's its own path) */
+            rc = redit_merge_one(L, 0, path_mode(fs, 0644), path_size(fs), arc, fs, keep_existing);
+            free(arc);
+        } else {
+            free(fs); free(arc);            /* skip sockets/fifos/dangling links */
+        }
+    }
+    free_names(names, n);
+    return rc;
+}
+
+/* Copy `span` compressed bytes at `off` in the source archive to `out`,
+ * streaming so a huge member is not buffered whole. */
+static int copy_span(squish_archive *a, u64 off, u64 span, FILE *out) {
+    if (off > a->filesize || span > a->filesize - off) return SQUISH_E_FORMAT;
+    if (a->mem) {
+        if (span && fwrite(a->mem + off, 1, (size_t)span, out) != (size_t)span)
+            return SQUISH_E_IO;
+        return SQUISH_OK;
+    }
+    if (span && sq_fseek64(a->f, off) != 0) return SQUISH_E_IO;
+    u8 buf[1 << 16];
+    while (span) {
+        size_t want = span < sizeof buf ? (size_t)span : sizeof buf;
+        if (fread(buf, 1, want, a->f) != want) return SQUISH_E_IO;
+        if (fwrite(buf, 1, want, out) != want) return SQUISH_E_IO;
+        span -= want;
+    }
+    return SQUISH_OK;
+}
+
+/* Serialize L into an index blob (same layout as arc_build_index). */
+static int redit_build_index(const redit_list *L, gbuf *idx) {
+    for (size_t i = 0; i < L->n; i++) {
+        const redit *e = &L->e[i];
+        size_t plen = strlen(e->path);
+        if (gbuf_u8(idx, e->type) || gbuf_u32(idx, e->mode) ||
+            gbuf_u64(idx, e->orig) || gbuf_u64(idx, e->off) ||
+            gbuf_u32(idx, (u32)plen))
+            return SQUISH_E_NOMEM;
+        for (u32 b = 0; b < e->nblk; b++)
+            if (gbuf_u64(idx, e->csz[b])) return SQUISH_E_NOMEM;
+        if (gbuf_put(idx, e->path, plen)) return SQUISH_E_NOMEM;
+    }
+    return SQUISH_OK;
+}
+
+/* Write the rebuilt archive described by L to tmp_path: sort into canonical
+ * order, copy survivor blocks verbatim from `a`, compress `fs` files at `chunk`,
+ * then append the index and finalize the header. */
+static int redit_write(const char *tmp_path, squish_archive *a, redit_list *L,
+                       u64 chunk, int nthreads,
+                       squish_progress_fn cb, void *user) {
+    if (L->n > 1) qsort(L->e, L->n, sizeof(redit), redit_cmp);
+
+    /* Progress denominator; a good estimate now, made exact from the bytes
+     * actually read once the added files have been written (below). */
+    u64 total = 0;
+    for (size_t i = 0; i < L->n; i++)
+        if (L->e[i].type == 0) total += L->e[i].orig;
+
+    FILE *f = fopen(tmp_path, "wb+");
+    if (!f) return SQUISH_E_IO;
+
+    u8 hdr[ARC_HDR];
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, ARC_MAGIC, 8);
+    put_le(hdr + 8, ARC_VERSION, 4);
+    int rc = SQUISH_OK;
+    if (fwrite(hdr, 1, ARC_HDR, f) != ARC_HDR) { rc = SQUISH_E_IO; goto done; }
+
+    u64 off = ARC_HDR, processed = 0;
+    for (size_t i = 0; i < L->n && rc == SQUISH_OK; i++) {
+        redit *e = &L->e[i];
+        if (e->type == 1) { e->off = 0; e->nblk = 0; continue; }  /* directory */
+
+        if (e->fs) {                                  /* newly added file */
+            u8 *data; size_t dl;
+            rc = read_whole(e->fs, &data, &dl);
+            if (rc != SQUISH_OK) break;
+            u8 **bufs; size_t *lens; u32 k;
+            rc = compress_member(data, dl, nthreads, chunk, &bufs, &lens, &k, NULL, NULL);
+            free(data);
+            if (rc != SQUISH_OK) break;
+            e->orig = dl; e->nblk = k;
+            free(e->csz);
+            e->csz = (u64*)malloc(k ? k * sizeof(u64) : 1);
+            if (!e->csz) { for (u32 j=0;j<k;j++) free(bufs[j]); free(bufs); free(lens);
+                           rc = SQUISH_E_NOMEM; break; }
+            u64 span = 0; int ok = 1;
+            for (u32 j = 0; j < k; j++) {
+                e->csz[j] = lens[j]; span += lens[j];
+                if (fwrite(bufs[j], 1, lens[j], f) != lens[j]) ok = 0;
+                free(bufs[j]);
+            }
+            free(bufs); free(lens);
+            if (!ok) { rc = SQUISH_E_IO; break; }
+            e->off = dl ? off : 0;
+            off += span;
+            processed += dl;
+        } else {                                      /* survivor: copy blocks */
+            u64 span = 0;
+            for (u32 j = 0; j < e->nblk; j++) span += e->csz[j];
+            if (e->orig == 0) {
+                e->off = 0;
+            } else {
+                rc = copy_span(a, e->off, span, f);
+                if (rc != SQUISH_OK) break;
+                e->off = off;
+                off += span;
+            }
+            processed += e->orig;
+        }
+        if (cb) cb(processed, total, user);
+    }
+    if (rc != SQUISH_OK) goto done;
+
+    /* exact total from the sizes actually written (new files may have changed
+     * size since they were scanned) */
+    total = 0;
+    for (size_t i = 0; i < L->n; i++)
+        if (L->e[i].type == 0) total += L->e[i].orig;
+
+    {   /* index: build, compress into one block, append */
+        gbuf idx = { NULL, 0, 0 };
+        rc = redit_build_index(L, &idx);
+        if (rc != SQUISH_OK) { free(idx.p); goto done; }
+        gbuf iblk = { NULL, 0, 0 };
+        u64 icl = 0, iorig = 0;
+        rc = arc_write_index(&idx, &iblk, &icl, &iorig);
+        free(idx.p);
+        if (rc != SQUISH_OK) { free(iblk.p); goto done; }
+        int ok = (iblk.len == 0) || (fwrite(iblk.p, 1, iblk.len, f) == iblk.len);
+        free(iblk.p);
+        if (!ok) { rc = SQUISH_E_IO; goto done; }
+
+        arc_put_header(hdr, 0, (u64)L->n, total, chunk, off, icl, iorig);
+        if (sq_fseek64(f, 0) != 0 || fwrite(hdr, 1, ARC_HDR, f) != ARC_HDR)
+            rc = SQUISH_E_IO;
+    }
+    if (rc == SQUISH_OK && cb) cb(total, total, user);
+
+done:
+    if (fclose(f) != 0 && rc == SQUISH_OK) rc = SQUISH_E_IO;
+    if (rc != SQUISH_OK) remove(tmp_path);
+    return rc;
+}
+
+/* Sibling temp path "<archive_path>.sqtmp". */
+static char *tmp_sibling(const char *path) {
+    size_t n = strlen(path);
+    char *t = (char*)malloc(n + 7);
+    if (!t) return NULL;
+    memcpy(t, path, n);
+    memcpy(t + n, ".sqtmp", 7);
+    return t;
+}
+
+/* Atomically replace dst with tmp (both on the same filesystem). */
+static int replace_file(const char *tmp, const char *dst) {
+#if defined(_WIN32)
+    return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+#else
+    return rename(tmp, dst);
+#endif
+}
+
+SQUISH_API int squish_archive_add(const char *archive_path,
+                                  const char *src_path, const char *arc_path,
+                                  int nthreads, unsigned flags,
+                                  squish_progress_fn cb, void *user) {
+    if (!archive_path || !src_path || !arc_path) return SQUISH_E_PARAM;
+    size_t apl = strlen(arc_path);
+    if (apl == 0 || apl > ARC_MAX_PATH || !arc_path_safe(arc_path, apl))
+        return SQUISH_E_PARAM;
+    int keep_existing = (flags & SQUISH_ADD_KEEP_EXISTING) != 0;
+    int src_dir = path_is_dir(src_path);
+    if (!src_dir && !path_is_regular(src_path)) return SQUISH_E_IO;
+
+    squish_archive *a;
+    int rc = squish_archive_open(archive_path, &a);
+    if (rc != SQUISH_OK) return rc;
+    if (a->flags & ARC_FLAG_SINGLE) { squish_archive_close(a); return SQUISH_E_PARAM; }
+    u64 chunk = a->chunk;      /* one block size per archive; keep it */
+
+    redit_list L = { NULL, 0, 0 };
+    /* survivors: every existing member (the new tree merges into them) */
+    for (u64 i = 0; i < a->nents && rc == SQUISH_OK; i++)
+        rc = redit_push_survivor(&L, &a->ents[i]);
+    if (rc == SQUISH_OK) rc = redit_ensure_ancestors(&L, arc_path);
+    if (rc == SQUISH_OK) {
+        if (src_dir) {
+            rc = redit_merge_one(&L, 1, path_mode(src_path, 0755), 0, arc_path,
+                                 NULL, keep_existing);
+            if (rc == SQUISH_OK) rc = redit_scan_add(&L, src_path, arc_path, keep_existing);
+        } else {
+            char *fs = dupstr(src_path);
+            rc = fs ? redit_merge_one(&L, 0, path_mode(src_path, 0644),
+                                      path_size(src_path), arc_path, fs, keep_existing)
+                    : SQUISH_E_NOMEM;
+        }
+    }
+
+    char *tmp = NULL;
+    if (rc == SQUISH_OK) { tmp = tmp_sibling(archive_path); if (!tmp) rc = SQUISH_E_NOMEM; }
+    if (rc == SQUISH_OK) rc = redit_write(tmp, a, &L, chunk, nthreads, cb, user);
+
+    squish_archive_close(a);       /* release the read handle before replacing */
+    redit_list_free(&L);
+    if (rc == SQUISH_OK && replace_file(tmp, archive_path) != 0) {
+        remove(tmp); rc = SQUISH_E_IO;
+    }
+    free(tmp);
+    return rc;
+}
+
+SQUISH_API int squish_archive_remove(const char *archive_path,
+                                     const char *const *paths, size_t npaths,
+                                     squish_progress_fn cb, void *user) {
+    if (!archive_path || !paths || npaths == 0) return SQUISH_E_PARAM;
+
+    squish_archive *a;
+    int rc = squish_archive_open(archive_path, &a);
+    if (rc != SQUISH_OK) return rc;
+    if (a->flags & ARC_FLAG_SINGLE) { squish_archive_close(a); return SQUISH_E_PARAM; }
+
+    redit_list L = { NULL, 0, 0 };
+    int matched = 0;
+    for (u64 i = 0; i < a->nents && rc == SQUISH_OK; i++) {
+        int drop = 0;
+        for (size_t p = 0; p < npaths && !drop; p++) {
+            const char *pp = paths[p];
+            if (!pp) continue;
+            size_t pl = strlen(pp);
+            while (pl > 1 && pp[pl-1] == '/') pl--;
+            if (pl && under_prefix(a->ents[i].path, pp, pl)) { drop = 1; matched = 1; }
+        }
+        if (!drop) rc = redit_push_survivor(&L, &a->ents[i]);
+    }
+    if (rc == SQUISH_OK && !matched) rc = SQUISH_E_FORMAT;   /* nothing matched */
+
+    char *tmp = NULL;
+    if (rc == SQUISH_OK) { tmp = tmp_sibling(archive_path); if (!tmp) rc = SQUISH_E_NOMEM; }
+    if (rc == SQUISH_OK) rc = redit_write(tmp, a, &L, a->chunk, 0, cb, user);
+
+    squish_archive_close(a);
+    redit_list_free(&L);
+    if (rc == SQUISH_OK && replace_file(tmp, archive_path) != 0) {
+        remove(tmp); rc = SQUISH_E_IO;
+    }
+    free(tmp);
+    return rc;
+}
+
 /* ---------------- in-memory archive -> buffer (single member) ------------ */
 SQUISH_API int squish_decompress_alloc(const void *src, size_t src_len,
                                        void **dst, size_t *dst_len,

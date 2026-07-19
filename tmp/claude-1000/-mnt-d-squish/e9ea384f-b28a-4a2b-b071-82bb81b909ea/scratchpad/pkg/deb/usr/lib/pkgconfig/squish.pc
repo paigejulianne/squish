@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=/usr/lib
+includedir=${prefix}/include
+
+Name: squish
+Description: context-mixing compressor
+Version: 1.0.0
+Libs: -L${libdir} -lsquish -lm -pthread
+Cflags: -I${includedir}

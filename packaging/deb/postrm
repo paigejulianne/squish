@@ -1,0 +1,7 @@
+#!/bin/sh
+# Refresh the dynamic linker cache after libsquish is removed or upgraded.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
+    ldconfig
+fi

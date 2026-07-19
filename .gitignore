@@ -5,6 +5,11 @@
 *.so.*
 /squish
 
+# Package build output (make deb / make rpm / make packages)
+/build/
+*.deb
+*.rpm
+
 # Windows build artifacts (mingw 'make dll' / MSVC 'make windows-dll')
 *.obj
 *.dll

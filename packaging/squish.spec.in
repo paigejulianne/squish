@@ -1,0 +1,55 @@
+# Single binary package: no separate -debuginfo subpackage.
+%global debug_package %{nil}
+
+# Absolute path to the source checkout this package is built from. Filled in by
+# the Makefile's `rpm' target; the package is built in place from that tree.
+%global _squish_srcdir @SRCDIR@
+
+Name:           squish
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
+Summary:        Context-mixing file compressor
+
+License:        GPL-3.0-or-later
+URL:            https://github.com/squish-compression/squish
+
+%description
+SQUISH treats compression as prediction: ten statistical models estimate the
+probability of every bit, an online-trained logistic mixer fuses their votes,
+and an arithmetic coder turns the probabilities into bits. It outcompresses
+zip -9, bzip2 -9, and rar -m5 across a standard corpus, spending extra CPU to
+buy the ratio.
+
+This package provides the squish command-line tool, the shared and static
+libsquish libraries, the public header, and a pkg-config file.
+
+%prep
+# Built in place from the checkout at %{_squish_srcdir}; nothing to unpack.
+
+%build
+make -C %{_squish_srcdir} OPT="%{optflags} -funroll-loops" all
+
+%install
+make -C %{_squish_srcdir} install \
+    DESTDIR=%{buildroot} PREFIX=%{_prefix} LIBDIR=%{_libdir}
+install -Dm644 %{_squish_srcdir}/LICENSE \
+    %{buildroot}%{_prefix}/share/licenses/%{name}/LICENSE
+install -Dm644 %{_squish_srcdir}/README.md \
+    %{buildroot}%{_prefix}/share/doc/%{name}/README.md
+
+%files
+%license %{_prefix}/share/licenses/%{name}/LICENSE
+%doc %{_prefix}/share/doc/%{name}/README.md
+%{_bindir}/squish
+%{_libdir}/libsquish.so
+%{_libdir}/libsquish.so.*
+%{_libdir}/libsquish.a
+%{_includedir}/squish.h
+%{_libdir}/pkgconfig/squish.pc
+
+%post -p /sbin/ldconfig
+%postun -p /sbin/ldconfig
+
+%changelog
+* Sun Jul 19 2026 Paige Julianne Sullivan <wiley14@gmail.com> - 1.0.0-1
+- Initial RPM packaging.

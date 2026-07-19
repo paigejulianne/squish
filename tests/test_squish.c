@@ -89,6 +89,14 @@ static uint8_t *slurp(const char *path, size_t *n) {
     if (b) *n = (size_t)sz;
     return b;
 }
+/* 1 if the whole file at `path` equals ref[0..rn) */
+static int img_is(const char *path, const uint8_t *ref, size_t rn) {
+    size_t n = 0;
+    uint8_t *b = slurp(path, &n);
+    int ok = b && n == rn && memcmp(b, ref, rn) == 0;
+    free(b);
+    return ok;
+}
 
 /* Buffer round-trip through a one-member archive. nthreads/chunk exercise
  * both the single-block and multi-block layouts. */
@@ -429,6 +437,177 @@ int main(void) {
             CHECK(squish_archive_probe("not-an-archive!!", 16) == 0, "  probe non-archive");
             squish_archive_close(M);
             free(img);
+        }
+
+        /* --- editing: squish_archive_add / squish_archive_remove ---------- *
+         * The fixture archive `arc` has 6 members:
+         *   a.txt, empty/, sub/, sub/b.bin, sub/deep/, sub/deep/c.txt        */
+        {
+            static uint8_t zdat[2000], gdat[1500], hdat[4096];
+            for (size_t i = 0; i < sizeof zdat; i++) zdat[i] = "EDIT-me\n"[i % 8];
+            for (size_t i = 0; i < sizeof gdat; i++) gdat[i] = (uint8_t)('A' + (i % 26));
+            for (size_t i = 0; i < sizeof hdat; i++) hdat[i] = rnd();
+            wfile("tests/.t_z.dat", zdat, sizeof zdat);
+
+            /* canonical baseline: an edit that nets to the same tree must
+             * reproduce this image byte-for-byte */
+            size_t base_n = 0;
+            uint8_t *base_img = slurp(arc, &base_n);
+            CHECK(base_img != NULL, "edit: baseline snapshot");
+
+            squish_archive *E = NULL; squish_archive_entry se;
+            void *m = NULL; size_t mn = 0; uint64_t idx;
+            const char *rmv[1];
+
+            /* add a file at the root */
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "z.txt", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "add file at root");
+            CHECK(squish_archive_open(arc, &E) == SQUISH_OK && E, "  reopen");
+            CHECK(E && squish_archive_count(E) == 7, "  count is 7");
+            CHECK(E && squish_archive_find(E, "z.txt", &idx) == SQUISH_OK &&
+                  squish_archive_extract(E, idx, &m, &mn) == SQUISH_OK &&
+                  mn == sizeof zdat && memcmp(m, zdat, mn) == 0, "  added bytes match");
+            squish_free(m); m = NULL;
+            /* a survivor's bytes are preserved verbatim across the rewrite */
+            CHECK(E && squish_archive_extract_path(E, "sub/b.bin", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof bbin && memcmp(m, bbin, mn) == 0, "  survivor bytes intact");
+            squish_free(m); m = NULL;
+            squish_archive_close(E); E = NULL;
+
+            /* removing it returns the archive to the canonical baseline image */
+            rmv[0] = "z.txt";
+            CHECK(squish_archive_remove(arc, rmv, 1, NULL, NULL)
+                  == SQUISH_OK, "remove the added file");
+            CHECK(img_is(arc, base_img, base_n), "  image identical to a fresh pack");
+
+            /* add creating missing ancestor directories */
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "n1/n2/f.dat", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "add with missing ancestors");
+            CHECK(squish_archive_open(arc, &E) == SQUISH_OK, "  reopen");
+            CHECK(E && squish_archive_count(E) == 9, "  count is 9 (2 dirs + file)");
+            CHECK(E && squish_archive_find(E, "n1", &idx) == SQUISH_OK &&
+                  squish_archive_stat(E, idx, &se) == SQUISH_OK && se.is_dir,
+                  "  n1 dir created");
+            CHECK(E && squish_archive_extract_path(E, "n1/n2/f.dat", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof zdat && memcmp(m, zdat, mn) == 0, "  nested file extracts");
+            squish_free(m); m = NULL;
+            squish_archive_close(E); E = NULL;
+            rmv[0] = "n1";
+            CHECK(squish_archive_remove(arc, rmv, 1, NULL, NULL)
+                  == SQUISH_OK, "remove the subtree");
+            CHECK(img_is(arc, base_img, base_n), "  back to baseline image");
+
+            /* add a whole directory tree */
+            MKDIR("tests/.t_dd");
+            MKDIR("tests/.t_dd/subdir");
+            wfile("tests/.t_dd/g.txt", gdat, sizeof gdat);
+            wfile("tests/.t_dd/subdir/h.bin", hdat, sizeof hdat);
+            CHECK(squish_archive_add(arc, "tests/.t_dd", "docs", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "add directory tree");
+            CHECK(squish_archive_open(arc, &E) == SQUISH_OK, "  reopen");
+            CHECK(E && squish_archive_count(E) == 10, "  count is 10 (+docs,+subdir,+2 files)");
+            CHECK(E && squish_archive_extract_path(E, "docs/g.txt", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof gdat && memcmp(m, gdat, mn) == 0, "  docs/g.txt extracts");
+            squish_free(m); m = NULL;
+            CHECK(E && squish_archive_extract_path(E, "docs/subdir/h.bin", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof hdat && memcmp(m, hdat, mn) == 0, "  docs/subdir/h.bin extracts");
+            squish_free(m); m = NULL;
+            squish_archive_close(E); E = NULL;
+
+            /* merge a second tree into docs/: adds a new file, keeps the old */
+            remove("tests/.t_dd/subdir/h.bin");
+            RMDIR("tests/.t_dd/subdir");
+            remove("tests/.t_dd/g.txt");
+            wfile("tests/.t_dd/k.txt", gdat, sizeof gdat);
+            CHECK(squish_archive_add(arc, "tests/.t_dd", "docs", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "merge into existing docs/");
+            CHECK(squish_archive_open(arc, &E) == SQUISH_OK, "  reopen");
+            CHECK(E && squish_archive_find(E, "docs/g.txt", NULL) == SQUISH_OK &&
+                  squish_archive_find(E, "docs/subdir/h.bin", NULL) == SQUISH_OK &&
+                  squish_archive_find(E, "docs/k.txt", NULL) == SQUISH_OK,
+                  "  merge kept old files and added the new one");
+            squish_archive_close(E); E = NULL;
+
+            rmv[0] = "docs";
+            CHECK(squish_archive_remove(arc, rmv, 1, NULL, NULL)
+                  == SQUISH_OK, "remove the directory tree");
+            CHECK(img_is(arc, base_img, base_n), "  back to baseline image");
+
+            /* KEEP_EXISTING leaves a colliding file untouched */
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "a.txt", 1,
+                                     SQUISH_ADD_KEEP_EXISTING, NULL, NULL)
+                  == SQUISH_OK, "add a.txt with KEEP_EXISTING");
+            CHECK(img_is(arc, base_img, base_n), "  existing a.txt kept (image unchanged)");
+
+            /* replace an existing member, then restore it */
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "a.txt", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "replace existing a.txt");
+            CHECK(squish_archive_open(arc, &E) == SQUISH_OK, "  reopen");
+            CHECK(E && squish_archive_count(E) == 6, "  count unchanged (replaced)");
+            CHECK(E && squish_archive_extract_path(E, "a.txt", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof zdat && memcmp(m, zdat, mn) == 0, "  a.txt now holds new bytes");
+            squish_free(m); m = NULL;
+            squish_archive_close(E); E = NULL;
+            CHECK(squish_archive_add(arc, "tests/.t_arc/a.txt", "a.txt", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "restore original a.txt");
+            CHECK(img_is(arc, base_img, base_n), "  restored to baseline image");
+
+            /* remove a multi-member subtree, leaving unrelated members intact.
+             * sub/, sub/b.bin, sub/deep/, sub/deep/c.txt go; a.txt, empty/ stay */
+            rmv[0] = "sub";
+            CHECK(squish_archive_remove(arc, rmv, 1, NULL, NULL)
+                  == SQUISH_OK, "remove sub/ subtree");
+            CHECK(squish_archive_open(arc, &E) == SQUISH_OK, "  reopen");
+            CHECK(E && squish_archive_count(E) == 2, "  count is 2 (a.txt, empty/)");
+            CHECK(E && squish_archive_find(E, "sub/b.bin", NULL) == SQUISH_E_FORMAT,
+                  "  sub/b.bin gone");
+            CHECK(E && squish_archive_extract_path(E, "a.txt", &m, &mn) == SQUISH_OK &&
+                  mn == sizeof atxt && memcmp(m, atxt, mn) == 0, "  a.txt survives intact");
+            squish_free(m); m = NULL;
+            squish_archive_close(E); E = NULL;
+            /* rebuild the fixture: re-adding sub/ restores the baseline exactly */
+            CHECK(squish_archive_add(arc, "tests/.t_arc/sub", "sub", 1, 0, NULL, NULL)
+                  == SQUISH_OK, "re-add sub/");
+            CHECK(img_is(arc, base_img, base_n), "  fixture restored to baseline");
+
+            /* progress callback is invoked and monotonic */
+            progress_state.calls = 0; progress_state.done = 0; progress_state.monotonic = 1;
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "z.txt", 1, 0,
+                                     progress_probe, NULL) == SQUISH_OK, "add with progress");
+            CHECK(progress_state.calls > 0 && progress_state.monotonic, "  progress reported");
+            rmv[0] = "z.txt";
+            squish_archive_remove(arc, rmv, 1, NULL, NULL);
+
+            /* error paths (the archive must be left untouched) */
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "../evil", 1, 0, NULL, NULL)
+                  == SQUISH_E_PARAM, "add rejects unsafe path");
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "/abs", 1, 0, NULL, NULL)
+                  == SQUISH_E_PARAM, "add rejects absolute path");
+            CHECK(squish_archive_add(arc, "tests/.t_z.dat", "", 1, 0, NULL, NULL)
+                  == SQUISH_E_PARAM, "add rejects empty path");
+            CHECK(squish_archive_add(arc, "tests/.t_nope", "x.txt", 1, 0, NULL, NULL)
+                  == SQUISH_E_IO, "add rejects missing source");
+            CHECK(squish_archive_remove(arc, NULL, 0, NULL, NULL)
+                  == SQUISH_E_PARAM, "remove rejects zero paths");
+            rmv[0] = "no-such-member";
+            CHECK(squish_archive_remove(arc, rmv, 1, NULL, NULL)
+                  == SQUISH_E_FORMAT, "remove of nothing -> E_FORMAT");
+            CHECK(img_is(arc, base_img, base_n), "  archive untouched after errors");
+
+            /* editing a SINGLE-flag archive is refused */
+            CHECK(squish_compress_file("tests/.t_z.dat", "tests/.t_single.sqsh", 1, 0,
+                                       NULL, NULL) == SQUISH_OK, "make single-file archive");
+            CHECK(squish_archive_add("tests/.t_single.sqsh", "tests/.t_z.dat", "y.txt",
+                                     1, 0, NULL, NULL) == SQUISH_E_PARAM, "  add on SINGLE -> E_PARAM");
+            rmv[0] = "tests";
+            CHECK(squish_archive_remove("tests/.t_single.sqsh", rmv, 1, NULL, NULL)
+                  == SQUISH_E_PARAM, "  remove on SINGLE -> E_PARAM");
+            remove("tests/.t_single.sqsh");
+
+            free(base_img);
+            remove("tests/.t_z.dat");
+            remove("tests/.t_dd/k.txt");
+            RMDIR("tests/.t_dd");
         }
 
         /* cleanup fixture tree (files then dirs, bottom-up) */

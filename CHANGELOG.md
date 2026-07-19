@@ -9,6 +9,21 @@ Per [CONTRIBUTING.md](CONTRIBUTING.md), any change to the model constants in
 
 ## [Unreleased]
 
+### Added
+
+- **In-place archive editing.** `squish_archive_add` and
+  `squish_archive_remove` change an existing archive's member set without
+  re-packing it: surviving members are copied byte-for-byte (their compressed
+  blocks are moved verbatim), so only newly added files are ever compressed.
+  Each edit rebuilds into a sibling temp file and atomically replaces the
+  original — an interrupted edit leaves the archive untouched — and the result
+  is byte-identical to `squish_archive_create` on the same resulting tree.
+  `add` merges a file or directory tree in at an archive path (creating missing
+  parent directories; a directory merges into an existing one, overwriting
+  colliding files or, with `SQUISH_ADD_KEEP_EXISTING`, keeping them); `remove`
+  drops members by path or subtree. Both operate on packed (non-`SINGLE`)
+  archives. See docs/API.md.
+
 ### Changed
 
 - **One on-disk format.** Everything SQUISH writes is now a single seekable
