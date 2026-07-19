@@ -1,0 +1,7 @@
+{
+  "_comment": "Azure Trusted Signing details for SQUISH, read at build time by build-windows.bat (which drives the 'sign' .NET global tool). These are account identifiers, not secrets -- signing authenticates with your Azure credentials (locally: 'az login'; CI: AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET or a managed identity). Matching TRUSTED_SIGNING_* environment variables, if set, override these values. Delete or rename this file to build without signing.",
+  "endpoint": "https://eus.codesigning.azure.net/",
+  "account": "SullivanTechnology",
+  "certificateProfile": "Personal",
+  "timestampUrl": "http://timestamp.acs.microsoft.com/"
+}

@@ -45,14 +45,16 @@ echo Built squish.dll and squish.exe
 
 rem --- Azure Trusted Signing --------------------------------------------------
 rem Signs the built binaries with Azure Trusted Signing (a cloud certificate
-rem profile; no local .pfx). Signing is opt-in: it runs only when the three
-rem TRUSTED_SIGNING_* variables below are set, so contributors without a
-rem Trusted Signing account still get an (unsigned) build.
+rem profile; no local .pfx). The signer details are read from signer.json next
+rem to this script -- account identifiers only, no secrets -- so signing turns
+rem on automatically whenever that file is present. Delete or rename signer.json
+rem to build without signing (contributors without an account still get a build).
 rem
-rem Configure by exporting these in your environment before running:
-rem   TRUSTED_SIGNING_ENDPOINT  region endpoint, e.g. https://eus.codesigning.azure.net/
-rem   TRUSTED_SIGNING_ACCOUNT   your Trusted Signing account name
-rem   TRUSTED_SIGNING_PROFILE   your certificate profile name
+rem signer.json fields (each overridable by the matching environment variable):
+rem   endpoint            TRUSTED_SIGNING_ENDPOINT   region endpoint URI
+rem   account             TRUSTED_SIGNING_ACCOUNT    Trusted Signing account name
+rem   certificateProfile  TRUSTED_SIGNING_PROFILE    certificate profile name
+rem   timestampUrl        TRUSTED_SIGNING_TIMESTAMP  RFC-3161 timestamp URL (optional)
 rem
 rem Authentication uses the Azure credential chain (DefaultAzureCredential):
 rem   - Interactive dev machine:  run `az login` first
@@ -63,6 +65,13 @@ rem                               AZURE_CLIENT_SECRET
 rem The signer is the `sign` .NET global tool (https://github.com/dotnet/sign),
 rem installed automatically below if missing (needs the .NET SDK on PATH).
 
+rem Load signer.json (if present); values already in the environment win.
+set "SIGNER_JSON=%~dp0signer.json"
+if exist "%SIGNER_JSON%" (
+    for /f "usebackq tokens=1* delims==" %%a in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$j='%SIGNER_JSON%'; $c = ConvertFrom-Json (Get-Content -Raw -LiteralPath $j); $m = [ordered]@{ TRUSTED_SIGNING_ENDPOINT = $c.endpoint; TRUSTED_SIGNING_ACCOUNT = $c.account; TRUSTED_SIGNING_PROFILE = $c.certificateProfile; TRUSTED_SIGNING_TIMESTAMP = $c.timestampUrl }; foreach ($k in $m.Keys) { $ev = [Environment]::GetEnvironmentVariable($k); $val = $(if ($ev) { $ev } else { $m[$k] }); if ($val) { $k + '=' + $val } }"`) do set "%%a=%%b"
+)
+
+rem Endpoint, account and profile are all required to sign.
 if not defined TRUSTED_SIGNING_ENDPOINT goto :nosign
 if not defined TRUSTED_SIGNING_ACCOUNT  goto :nosign
 if not defined TRUSTED_SIGNING_PROFILE  goto :nosign
@@ -86,10 +95,13 @@ set "PATH=%PATH%;%USERPROFILE%\.dotnet\tools"
 :dosign
 echo.
 echo Signing squish.dll and squish.exe with Azure Trusted Signing...
+set "TIMESTAMP_ARG="
+if defined TRUSTED_SIGNING_TIMESTAMP set "TIMESTAMP_ARG=--timestamp-url "%TRUSTED_SIGNING_TIMESTAMP%""
 sign code artifact-signing squish.dll squish.exe ^
     --artifact-signing-endpoint "%TRUSTED_SIGNING_ENDPOINT%" ^
     --artifact-signing-account "%TRUSTED_SIGNING_ACCOUNT%" ^
-    --artifact-signing-certificate-profile "%TRUSTED_SIGNING_PROFILE%"
+    --artifact-signing-certificate-profile "%TRUSTED_SIGNING_PROFILE%" ^
+    --file-digest sha256 %TIMESTAMP_ARG%
 if errorlevel 1 (
     echo error: code signing failed.
     exit /b 1
@@ -99,5 +111,5 @@ goto :eof
 
 :nosign
 echo.
-echo Note: Azure Trusted Signing not configured ^(TRUSTED_SIGNING_* unset^); binaries are unsigned.
+echo Note: Azure Trusted Signing not configured ^(no signer.json and TRUSTED_SIGNING_* unset^); binaries are unsigned.
 goto :eof
