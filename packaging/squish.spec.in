@@ -1,5 +1,7 @@
-# Single binary package: no separate -debuginfo subpackage.
+# Three packages from one spec: squish (CLI), libsquish1 (runtime shared
+# library), and libsquish-devel (development files). No -debuginfo subpackage.
 %global debug_package %{nil}
+%global sover 1
 
 # Absolute path to the source checkout this package is built from. Filled in by
 # the Makefile's `rpm' target; the package is built in place from that tree.
@@ -8,20 +10,31 @@
 Name:           squish
 Version:        @VERSION@
 Release:        @RELEASE@%{?dist}
-Summary:        Context-mixing file compressor
+Summary:        Context-mixing file compressor (command-line tool)
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/squish-compression/squish
 
 %description
-SQUISH treats compression as prediction: ten statistical models estimate the
-probability of every bit, an online-trained logistic mixer fuses their votes,
-and an arithmetic coder turns the probabilities into bits. It outcompresses
-zip -9, bzip2 -9, and rar -m5 across a standard corpus, spending extra CPU to
-buy the ratio.
+The squish command-line tool compresses and decompresses files and whole
+directory trees using SQUISH, a context-mixing compressor that outcompresses
+zip -9, bzip2 -9, and rar -m5 across a standard corpus at a higher CPU cost.
+The tool is statically linked and stands alone.
 
-This package provides the squish command-line tool, the shared and static
-libsquish libraries, the public header, and a pkg-config file.
+%package -n libsquish%{sover}
+Summary:        Context-mixing compressor shared library
+
+%description -n libsquish%{sover}
+Runtime shared library (libsquish.so.%{sover}) needed by programs that link
+against libsquish.
+
+%package -n libsquish-devel
+Summary:        Development files for libsquish
+Requires:       libsquish%{sover}%{?_isa} = %{version}-%{release}
+
+%description -n libsquish-devel
+Header, static library, versioned .so symlink, and pkg-config file for building
+and linking against libsquish.
 
 %prep
 # Built in place from the checkout at %{_squish_srcdir}; nothing to unpack.
@@ -32,8 +45,14 @@ make -C %{_squish_srcdir} OPT="%{optflags} -funroll-loops" all
 %install
 make -C %{_squish_srcdir} install \
     DESTDIR=%{buildroot} PREFIX=%{_prefix} LIBDIR=%{_libdir}
+# Each binary package ships its own license copy so a standalone install of any
+# one of them is self-contained.
 install -Dm644 %{_squish_srcdir}/LICENSE \
     %{buildroot}%{_prefix}/share/licenses/%{name}/LICENSE
+install -Dm644 %{_squish_srcdir}/LICENSE \
+    %{buildroot}%{_prefix}/share/licenses/libsquish%{sover}/LICENSE
+install -Dm644 %{_squish_srcdir}/LICENSE \
+    %{buildroot}%{_prefix}/share/licenses/libsquish-devel/LICENSE
 install -Dm644 %{_squish_srcdir}/README.md \
     %{buildroot}%{_prefix}/share/doc/%{name}/README.md
 
@@ -41,15 +60,21 @@ install -Dm644 %{_squish_srcdir}/README.md \
 %license %{_prefix}/share/licenses/%{name}/LICENSE
 %doc %{_prefix}/share/doc/%{name}/README.md
 %{_bindir}/squish
-%{_libdir}/libsquish.so
+
+%files -n libsquish%{sover}
+%license %{_prefix}/share/licenses/libsquish%{sover}/LICENSE
 %{_libdir}/libsquish.so.*
-%{_libdir}/libsquish.a
+
+%files -n libsquish-devel
+%license %{_prefix}/share/licenses/libsquish-devel/LICENSE
 %{_includedir}/squish.h
+%{_libdir}/libsquish.a
+%{_libdir}/libsquish.so
 %{_libdir}/pkgconfig/squish.pc
 
-%post -p /sbin/ldconfig
-%postun -p /sbin/ldconfig
+%post -n libsquish%{sover} -p /sbin/ldconfig
+%postun -n libsquish%{sover} -p /sbin/ldconfig
 
 %changelog
 * Sun Jul 19 2026 Paige Julianne Sullivan <wiley14@gmail.com> - 1.0.0-1
-- Initial RPM packaging.
+- Split into squish (CLI), libsquish1 (runtime), and libsquish-devel.

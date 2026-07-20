@@ -1,0 +1,14 @@
+Package: libsquish-dev
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Section: libdevel
+Priority: optional
+Homepage: https://github.com/squish-compression/squish
+Depends: libsquish1 (= @VERSION@)
+Description: context-mixing compressor — development files
+ Header, static library, versioned .so symlink, and pkg-config file for building
+ and linking against libsquish (-lsquish, or pkg-config squish).
+ .
+ SQUISH is a context-mixing file compressor shipped as a linkable C library with
+ a command-line tool.

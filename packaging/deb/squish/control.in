@@ -1,0 +1,16 @@
+Package: squish
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Section: utils
+Priority: optional
+Homepage: https://github.com/squish-compression/squish
+Depends: libc6
+Description: context-mixing file compressor (command-line tool)
+ The squish command-line tool compresses and decompresses files and whole
+ directory trees, outcompressing zip -9, bzip2 -9, and rar -m5 across a standard
+ corpus at a higher CPU cost. It lists archives and extracts single members
+ without inflating the rest.
+ .
+ The tool is statically linked; the libsquish shared library is packaged
+ separately as libsquish1 (runtime) and libsquish-dev (development files).

@@ -7,9 +7,9 @@
 #   make windows-dll   build squish.dll + squish.exe with MSVC (needs cl.exe
 #                       on PATH, e.g. a VS "Developer Command Prompt")
 #   make install    install to $(PREFIX) (default /usr/local)
-#   make deb        build a .deb installer (needs dpkg-deb)   -> build/
-#   make rpm        build a .rpm installer (needs rpmbuild)   -> build/
-#   make packages   build both .deb and .rpm
+#   make deb        build .deb packages (needs dpkg-deb)      -> build/
+#   make rpm        build .rpm packages (needs rpmbuild)      -> build/
+#   make packages   build both (libsquish1, libsquish-dev/-devel, squish)
 #   make clean
 
 CC       ?= gcc
@@ -36,8 +36,15 @@ RPM_ARCH       ?= x86_64
 # (e.g. a WSL /mnt drvfs mount, which dpkg-deb and rpm reject).
 PKGDIR          = build
 PKGROOT         = $(abspath $(PKGDIR))
-DEB_PKG         = $(PKGDIR)/squish_$(VERSION)_$(DEB_ARCH).deb
-RPM_PKG         = $(PKGDIR)/squish-$(VERSION)-$(PKG_RELEASE).$(RPM_ARCH).rpm
+# The library and tool split into three packages per format: a runtime shared
+# library (libsquish1), its development files (libsquish-dev / -devel), and the
+# CLI (squish).
+DEB_LIB         = $(PKGDIR)/libsquish1_$(VERSION)_$(DEB_ARCH).deb
+DEB_DEV         = $(PKGDIR)/libsquish-dev_$(VERSION)_$(DEB_ARCH).deb
+DEB_CLI         = $(PKGDIR)/squish_$(VERSION)_$(DEB_ARCH).deb
+RPM_LIB         = $(PKGDIR)/libsquish1-$(VERSION)-$(PKG_RELEASE).$(RPM_ARCH).rpm
+RPM_DEV         = $(PKGDIR)/libsquish-devel-$(VERSION)-$(PKG_RELEASE).$(RPM_ARCH).rpm
+RPM_CLI         = $(PKGDIR)/squish-$(VERSION)-$(PKG_RELEASE).$(RPM_ARCH).rpm
 
 MINGW    ?= x86_64-w64-mingw32-gcc
 MINGW_AR ?= x86_64-w64-mingw32-ar
@@ -146,26 +153,26 @@ install: libsquish.so libsquish.a squish
 	    "$(PREFIX)" "$(LIBDIR)" "$(VERSION)" > $(DESTDIR)$(LIBDIR)/pkgconfig/squish.pc
 
 # ---- Linux packages (.deb / .rpm) --------------------------------------------
-# Both are built from the same `make install' tree, so their file layout stays
-# in sync with a plain install. Output lands in build/. See packaging/README.md.
+# Each format yields three packages, partitioned from one `make install' tree so
+# the file layout stays in sync with a plain install: libsquish1 (runtime .so),
+# libsquish-dev/-devel (header, static lib, .so symlink, .pc), and squish (CLI).
+# Output lands in build/. See packaging/README.md.
 packages: deb rpm
 
-deb: all
+# Full install tree the packages are carved from (built once, shared by deb/rpm).
+stage:
+	rm -rf $(PKGROOT)/stage
+	$(MAKE) install DESTDIR=$(PKGROOT)/stage PREFIX=/usr LIBDIR=/usr/lib
+	strip --strip-unneeded $(PKGROOT)/stage/usr/lib/libsquish.so.$(VERSION)
+	strip $(PKGROOT)/stage/usr/bin/squish
+
+deb: all stage
 	@command -v dpkg-deb >/dev/null 2>&1 || { echo "error: dpkg-deb not found; install it (apt-get install dpkg)." >&2; exit 1; }
 	rm -rf $(PKGROOT)/deb
-	$(MAKE) install DESTDIR=$(PKGROOT)/deb PREFIX=/usr LIBDIR=/usr/lib
-	install -d $(PKGROOT)/deb/DEBIAN
-	sed -e 's|@VERSION@|$(VERSION)|g' -e 's|@ARCH@|$(DEB_ARCH)|g' \
-	    -e 's|@MAINTAINER@|$(PKG_MAINTAINER)|g' \
-	    packaging/deb/control.in > $(PKGROOT)/deb/DEBIAN/control
-	install -m 755 packaging/deb/postinst $(PKGROOT)/deb/DEBIAN/postinst
-	install -m 755 packaging/deb/postrm   $(PKGROOT)/deb/DEBIAN/postrm
-	install -d $(PKGROOT)/deb/usr/share/doc/squish
-	install -m 644 packaging/deb/copyright $(PKGROOT)/deb/usr/share/doc/squish/copyright
-	strip --strip-unneeded $(PKGROOT)/deb/usr/lib/libsquish.so.$(VERSION)
-	strip $(PKGROOT)/deb/usr/bin/squish
-	dpkg-deb --root-owner-group --build $(PKGROOT)/deb $(DEB_PKG)
-	@echo "built $(DEB_PKG)"
+	sh packaging/deb/build-debs.sh \
+	    $(PKGROOT)/stage $(PKGROOT) $(PKGROOT)/deb \
+	    $(VERSION) $(SOMAJOR) $(DEB_ARCH) "$(PKG_MAINTAINER)"
+	@echo "built $(DEB_LIB) $(DEB_DEV) $(DEB_CLI)"
 
 rpm: all
 	@command -v rpmbuild >/dev/null 2>&1 || { echo "error: rpmbuild not found; install it (apt-get install rpm / dnf install rpm-build)." >&2; exit 1; }
@@ -176,10 +183,10 @@ rpm: all
 	    packaging/squish.spec.in > $(PKGROOT)/rpm/squish.spec
 	rpmbuild -bb --target $(RPM_ARCH) \
 	    --define "_topdir $(PKGROOT)/rpm" \
-	    --define "_rpmdir $(PKGROOT)" \
-	    --define "_rpmfilename squish-$(VERSION)-$(PKG_RELEASE).$(RPM_ARCH).rpm" \
+	    --define "_rpmdir $(PKGROOT)/rpm/out" \
 	    $(PKGROOT)/rpm/squish.spec
-	@echo "built $(RPM_PKG)"
+	mv $(PKGROOT)/rpm/out/*/*.rpm $(PKGROOT)/
+	@echo "built $(RPM_LIB) $(RPM_DEV) $(RPM_CLI)"
 
 clean:
 	rm -rf $(PKGDIR)
@@ -188,4 +195,4 @@ clean:
 	      squish.obj squish_cli.obj squish.lib squish.exp \
 	      tests/test_squish examples/example
 
-.PHONY: all dll windows-dll test example install packages deb rpm clean
+.PHONY: all dll windows-dll test example install packages stage deb rpm clean

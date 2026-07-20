@@ -1,0 +1,15 @@
+Package: libsquish1
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Section: libs
+Priority: optional
+Homepage: https://github.com/squish-compression/squish
+Depends: libc6
+Description: context-mixing compressor — shared library
+ SQUISH treats compression as prediction: ten statistical models estimate the
+ probability of every bit, an online-trained logistic mixer fuses their votes,
+ and an arithmetic coder turns the probabilities into bits.
+ .
+ This package provides the runtime shared library (libsquish.so.1) needed by
+ programs that link against libsquish.
